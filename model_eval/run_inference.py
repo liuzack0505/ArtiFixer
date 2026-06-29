@@ -341,7 +341,12 @@ def get_eval_pipe(args: argparse.Namespace, device: torch.device):
             .to(torch.bfloat16)
             .to(device)
         )
-    return get_kv_cache_pipe(args, device).to(torch.bfloat16).to(device)
+
+    meta_transformer = args.checkpoint_pt is not None
+    pipe = get_kv_cache_pipe(args, device, meta_transformer=meta_transformer)
+    if meta_transformer:
+        return pipe
+    return pipe.to(torch.bfloat16).to(device)
 
 
 def create_context_parallel_meshes(
@@ -793,7 +798,12 @@ def main(args: argparse.Namespace, dataset_factory=create_dataset, output_dir_fa
         if rank == 0:
             print("Initialized pipeline")
 
-        load_transformer_checkpoint(pipe.transformer, args)
+        load_transformer_checkpoint(
+            pipe.transformer,
+            args,
+            target_device=device,
+            target_dtype=torch.bfloat16,
+        )
         pipe.transformer.eval()
 
         if rank == 0:

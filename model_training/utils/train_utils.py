@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from accelerate import Accelerator, DataLoaderConfiguration, FullyShardedDataParallelPlugin, ParallelismConfig
+from accelerate import Accelerator, DataLoaderConfiguration, FullyShardedDataParallelPlugin, ParallelismConfig, init_empty_weights
 from accelerate.utils import GradientAccumulationPlugin, ProjectConfiguration, set_seed
 from diffusers import AutoencoderKLWan, UniPCMultistepScheduler, WanTransformer3DModel
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -209,10 +209,33 @@ def barrier_if_distributed(group: dist.ProcessGroup | None = None) -> None:
         dist.barrier(group=group)
 
 
-def load_model_weights_from_dcp(model: torch.nn.Module, checkpoint_dir: Path | str) -> None:
+def load_model_weights_from_dcp(
+    model: torch.nn.Module,
+    checkpoint_dir: Path | str,
+    *,
+    target_device: torch.device | str | None = None,
+    target_dtype: torch.dtype | None = None,
+) -> None:
     state_dict = model.state_dict()
+    has_meta_tensors = any(tensor.is_meta for tensor in state_dict.values())
+    if has_meta_tensors:
+        if target_device is None:
+            target_device = (
+                torch.device(f"cuda:{torch.cuda.current_device()}")
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+        state_dict = {
+            name: torch.empty_like(
+                tensor,
+                device=target_device,
+                dtype=target_dtype if tensor.is_floating_point() and target_dtype is not None else tensor.dtype,
+            )
+            for name, tensor in state_dict.items()
+        }
+
     dcp.load({"model": state_dict}, dcp.FileSystemReader(str(checkpoint_dir)))
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, assign=has_meta_tensors)
 
 
 def get_accelerator(args: argparse.Namespace, run_id: str | None) -> Accelerator:
@@ -351,14 +374,37 @@ def get_pipe(
     )
 
 
-def get_kv_cache_pipe(args: argparse.Namespace, device: torch.device | str) -> ArtifixerKvCachePipeline:
+def get_kv_cache_pipe(
+    args: argparse.Namespace,
+    device: torch.device | str,
+    *,
+    meta_transformer: bool = False,
+) -> ArtifixerKvCachePipeline:
     vae = AutoencoderKLWan.from_pretrained(args.model_id, subfolder="vae", torch_dtype=torch.bfloat16).to(device)
+
+    if meta_transformer:
+        with init_empty_weights():
+            transformer = WanTransformer3DModel.from_config(
+                args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16
+            )
+    else:
+        transformer = WanTransformer3DModel.from_config(
+            args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16
+        ).to(device)
+
+    if meta_transformer:
+        with init_empty_weights():
+            transformer = WanTransformer3DModel.from_config(
+                args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16
+            )
+    else:
+        transformer = WanTransformer3DModel.from_config(
+            args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16
+        ).to(device)
 
     return ArtifixerKvCachePipeline(
         vae=vae,
-        transformer=WanTransformer3DModel.from_config(
-            args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16
-        ),
+        transformer=transformer,
         tokenizer=None,
         text_encoder=None,
         frames_per_block=args.frames_per_block,
