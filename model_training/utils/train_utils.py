@@ -307,6 +307,13 @@ def get_accelerator(args: argparse.Namespace, run_id: str | None) -> Accelerator
     return accelerator
 
 
+def _enable_vae_tiling_if_available(vae: AutoencoderKLWan) -> AutoencoderKLWan:
+    enable_tiling = getattr(vae, "enable_tiling", None)
+    if callable(enable_tiling):
+        enable_tiling()
+    return vae
+
+
 def _ensure_dcp_cache(model_id: str, dcp_cache_dir: Path) -> Path:
     """Ensure a DCP-format cache of the HF transformer weights exists, creating it if needed.
 
@@ -358,7 +365,9 @@ def get_pipe(
         dcp.load({"model": state_dict}, dcp.FileSystemReader(str(dcp_path)))
         transformer.load_state_dict(state_dict)
 
-    vae = AutoencoderKLWan.from_pretrained(args.model_id, subfolder="vae", torch_dtype=torch.bfloat16).to(device)
+    vae = _enable_vae_tiling_if_available(
+        AutoencoderKLWan.from_pretrained(args.model_id, subfolder="vae", torch_dtype=torch.bfloat16).to(device)
+    )
 
     return ArtifixerPipeline(
         vae=vae,
@@ -380,7 +389,9 @@ def get_kv_cache_pipe(
     *,
     meta_transformer: bool = False,
 ) -> ArtifixerKvCachePipeline:
-    vae = AutoencoderKLWan.from_pretrained(args.model_id, subfolder="vae", torch_dtype=torch.bfloat16).to(device)
+    vae = _enable_vae_tiling_if_available(
+        AutoencoderKLWan.from_pretrained(args.model_id, subfolder="vae", torch_dtype=torch.bfloat16).to(device)
+    )
 
     if meta_transformer:
         with init_empty_weights():
