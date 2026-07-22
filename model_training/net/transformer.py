@@ -824,6 +824,11 @@ def _apply_rotary_emb(
     freqs_cos: torch.Tensor,
     freqs_sin: torch.Tensor,
 ) -> torch.Tensor:
+    if freqs_cos.device != hidden_states.device:
+        freqs_cos = freqs_cos.to(hidden_states.device)
+    if freqs_sin.device != hidden_states.device:
+        freqs_sin = freqs_sin.to(hidden_states.device)
+
     x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
     cos = freqs_cos[..., 0::2]
     sin = freqs_sin[..., 1::2]
