@@ -389,6 +389,7 @@ def save_comparison_output(
     fps: int = 15,
     save_frames: bool = True,
     output_indices: torch.Tensor | None = None,
+    batch_size: int = 256,
 ):
     """
     Save comparison video/images with pred, optional gt, rendered side by side and neighbors below.
@@ -405,50 +406,73 @@ def save_comparison_output(
         output_indices: optional (T,) tensor of dataset frame indices for metric PNG names;
             -1 means the frame stays in videos but has no metric PNG output
     """
-    output = output.cpu().float().clamp(0, 1)
-    if rgb_gt is not None:
-        rgb_gt = rgb_gt.cpu().float().clamp(0, 1)
-    rgb_rendered = rgb_rendered.cpu().float().clamp(0, 1)
-    rgb_neighbors = rgb_neighbors.cpu().float().clamp(0, 1)
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
 
-    first_row = [output]
-    if rgb_gt is not None:
-        first_row.append(rgb_gt)
-    first_row.append(rgb_rendered)
-    result_rows = [torch.cat(first_row, dim=-1)]
-    columns = len(first_row)
-
+    columns = 2 if rgb_gt is None else 3
     num_frames = output.shape[0]
+    rgb_neighbors = rgb_neighbors.to(output.device).float().clamp(0, 1)
+
+    neighbor_rows = []
     for neighbor_index in range(0, rgb_neighbors.shape[0], columns):
         neighbors_in_row = rgb_neighbors[neighbor_index : neighbor_index + columns]
         if neighbors_in_row.shape[0] < columns:
             padding = torch.zeros(
-                columns - neighbors_in_row.shape[0], *neighbors_in_row.shape[1:], dtype=rgb_neighbors.dtype
+                columns - neighbors_in_row.shape[0],
+                *neighbors_in_row.shape[1:],
+                dtype=rgb_neighbors.dtype,
+                device=rgb_neighbors.device,
             )
             neighbors_in_row = torch.cat([neighbors_in_row, padding], dim=0)
-        row = torch.cat([n for n in neighbors_in_row], dim=-1)
-        row = row.unsqueeze(0).expand(num_frames, -1, -1, -1)
-        result_rows.append(row)
-
-    result = torch.cat(result_rows, dim=-2)
+        neighbor_rows.append(torch.cat([neighbor for neighbor in neighbors_in_row], dim=-1))
+    neighbor_panel = torch.cat(neighbor_rows, dim=-2)
 
     save_dir.mkdir(parents=True, exist_ok=True)
+    frames_dir = save_dir / f"{key}_all"
+    if not save_frames and frames_dir.exists():
+        shutil.rmtree(frames_dir)
+    frames_dir.mkdir(parents=True, exist_ok=True)
 
-    if save_frames:
-        frames_dir = save_dir / f"{key}_all"
-        frames_dir.mkdir(parents=True, exist_ok=True)
-        for frame_idx in range(num_frames):
-            if output_indices is not None:
+    video_frame_paths = []
+    temporary_frame_paths = []
+    for start in range(0, num_frames, batch_size):
+        end = min(start + batch_size, num_frames)
+        first_row = [output[start:end].float().clamp(0, 1)]
+        if rgb_gt is not None:
+            first_row.append(rgb_gt[start:end].float().clamp(0, 1))
+        first_row.append(rgb_rendered[start:end].float().clamp(0, 1))
+        comparison_batch = torch.cat(
+            [torch.cat(first_row, dim=-1), neighbor_panel.unsqueeze(0).expand(end - start, -1, -1, -1)],
+            dim=-2,
+        )
+        comparison_batch = comparison_batch.mul(255).round().byte().permute(0, 2, 3, 1).cpu().numpy()
+
+        for batch_idx, image_array in enumerate(comparison_batch):
+            frame_idx = start + batch_idx
+            image = Image.fromarray(image_array)
+            if save_frames and output_indices is not None:
                 output_idx = int(output_indices[frame_idx])
                 if output_idx == -1:
-                    continue
-                fname = f"{output_idx:05d}.png"
+                    frame_path = frames_dir / f".video_{frame_idx:05d}.png"
+                    temporary_frame_paths.append(frame_path)
+                else:
+                    frame_path = frames_dir / f"{output_idx:05d}.png"
             else:
-                fname = f"{frame_idx:05d}.png"
-            img = (result[frame_idx].permute(1, 2, 0) * 255).round().byte().cpu().numpy()
-            Image.fromarray(img).save(frames_dir / fname)
+                frame_path = frames_dir / f"{frame_idx:05d}.png"
+            image.save(frame_path)
+            video_frame_paths.append(frame_path)
 
-    save_video(result, save_dir / f"{key}.mp4", fps=fps)
+    try:
+        save_video(video_frame_paths, save_dir / f"{key}.mp4", fps=fps)
+    except Exception:
+        # Keep staged frames so a failed encode can be inspected or retried.
+        raise
+    else:
+        if save_frames:
+            for frame_path in temporary_frame_paths:
+                frame_path.unlink()
+        else:
+            shutil.rmtree(frames_dir)
 
 
 def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale, save_outputs: bool = True):
@@ -556,15 +580,15 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
         del opacity, camera_rays, w2cs, Ks, neighbor_w2cs, neighbor_Ks
         return
 
-    out = out[:, :original_num_frames].cpu()
-    rgb_gt_out = rgb_gt[:, :original_num_frames].cpu() if rgb_gt is not None else None
-    rgb_rendered_out = rgb_rendered[:, :original_num_frames].cpu()
+    out = out[:, :original_num_frames]
+    rgb_gt_out = rgb_gt[:, :original_num_frames] if rgb_gt is not None else None
+    rgb_rendered_out = rgb_rendered[:, :original_num_frames]
 
     valid_mask_list, output_indices_list, frame_indices = _eval_frame_metadata(item)
     assert (
         len(valid_mask_list) == original_num_frames
     ), f"valid_frames_mask has {len(valid_mask_list)} entries, expected {original_num_frames}"
-    valid_mask = torch.tensor(valid_mask_list, dtype=torch.bool)
+    valid_mask = torch.tensor(valid_mask_list, dtype=torch.bool, device=out.device)
 
     pred_all = out[0, valid_mask].float().clamp(0, 1)
     gt_all = rgb_gt_out[0, valid_mask].float().clamp(0, 1) if rgb_gt_out is not None else None
@@ -582,7 +606,7 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
             save_dir=scene_dir,
             key="default" if split is not None else "comparison",
             fps=args.output_fps,
-            save_frames=True,
+            save_frames=False,
             output_indices=output_indices,
         )
 
@@ -661,7 +685,7 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
                 diag_full_kwargs = dict(kwargs)
                 diag_full_kwargs.update(diag_kwargs)
                 diag_out = pipe.forward_inference(**diag_full_kwargs)
-                diag_out = diag_out[0, :original_num_frames].cpu()[valid_mask].float().clamp(0, 1)
+                diag_out = diag_out[0, :original_num_frames][valid_mask].float().clamp(0, 1)
                 save_comparison_output(
                     output=diag_out,
                     rgb_gt=gt_all,

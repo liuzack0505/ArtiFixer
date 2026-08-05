@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import io
+import os
 from pathlib import Path
 from typing import Any, BinaryIO
 
