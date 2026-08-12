@@ -17,6 +17,7 @@ import gc
 import math
 import os
 import shutil
+import time
 from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import Path
@@ -475,6 +476,24 @@ def save_comparison_output(
             shutil.rmtree(frames_dir)
 
 
+def write_inference_log(rank: int, device: torch.device, scene_id: str, inference_start: float) -> None:
+    torch.cuda.synchronize(device)
+    inference_seconds = time.perf_counter() - inference_start
+    peak_memory = torch.cuda.max_memory_allocated(device)
+
+    log_dir = Path("/data/log/artifixer")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    safe_scene_id = str(scene_id).replace(os.sep, "_")
+    log_path = log_dir / f"{time.time_ns()}_rank{rank}_{safe_scene_id}.txt"
+    log_path.write_text(
+        f"scene_id: {scene_id}\n"
+        f"rank: {rank}\n"
+        f"device: {device}\n"
+        f"inference_time_seconds: {inference_seconds:.6f}\n"
+        f"peak_memory_gib: {peak_memory / 1024**3:.3f}\n"
+    )
+
+
 def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale, save_outputs: bool = True):
     """
     Unified processing function for all evalsets.
@@ -563,10 +582,15 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
         "max_neighbors_per_encode": args.max_neighbors_per_encode,
     }
 
+    torch.cuda.synchronize(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    inference_start = time.perf_counter()
+
     if args.inference_pipeline == "kv_cache":
         latents = pipe.denoise_to_latents(**kwargs)
         if not save_outputs:
             pipe.clear_inference_caches()
+            write_inference_log(rank, device, scene_id, inference_start)
             del latents, rgb_gt, rgb_rendered, rgb_neighbors, rgb_neighbors_cpu, encoded_prompt
             del opacity, camera_rays, w2cs, Ks, neighbor_w2cs, neighbor_Ks
             return
@@ -574,6 +598,8 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
         del latents
     else:
         out = pipe.forward_inference(**kwargs)
+
+    write_inference_log(rank, device, scene_id, inference_start)
 
     if not save_outputs:
         del out, rgb_gt, rgb_rendered, rgb_neighbors, rgb_neighbors_cpu, encoded_prompt
