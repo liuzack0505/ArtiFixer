@@ -476,15 +476,20 @@ def save_comparison_output(
             shutil.rmtree(frames_dir)
 
 
-def write_inference_log(rank: int, device: torch.device, scene_id: str, inference_start: float) -> None:
+def write_inference_log(
+    rank: int,
+    device: torch.device,
+    scene_id: str,
+    inference_start: float,
+    result_dir: Path,
+) -> None:
     torch.cuda.synchronize(device)
     inference_seconds = time.perf_counter() - inference_start
     peak_memory = torch.cuda.max_memory_allocated(device)
 
-    log_dir = Path("/data/log/artifixer")
-    log_dir.mkdir(parents=True, exist_ok=True)
+    result_dir.mkdir(parents=True, exist_ok=True)
     safe_scene_id = str(scene_id).replace(os.sep, "_")
-    log_path = log_dir / f"{time.time_ns()}_rank{rank}_{safe_scene_id}.txt"
+    log_path = result_dir / f"{time.time_ns()}_rank{rank}_{safe_scene_id}.txt"
     log_path.write_text(
         f"scene_id: {scene_id}\n"
         f"rank: {rank}\n"
@@ -590,7 +595,7 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
         latents = pipe.denoise_to_latents(**kwargs)
         if not save_outputs:
             pipe.clear_inference_caches()
-            write_inference_log(rank, device, scene_id, inference_start)
+            write_inference_log(rank, device, scene_id, inference_start, output_dir)
             del latents, rgb_gt, rgb_rendered, rgb_neighbors, rgb_neighbors_cpu, encoded_prompt
             del opacity, camera_rays, w2cs, Ks, neighbor_w2cs, neighbor_Ks
             return
@@ -599,7 +604,7 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
     else:
         out = pipe.forward_inference(**kwargs)
 
-    write_inference_log(rank, device, scene_id, inference_start)
+    write_inference_log(rank, device, scene_id, inference_start, output_dir)
 
     if not save_outputs:
         del out, rgb_gt, rgb_rendered, rgb_neighbors, rgb_neighbors_cpu, encoded_prompt
