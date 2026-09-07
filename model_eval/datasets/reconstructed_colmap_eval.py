@@ -36,6 +36,7 @@ from model_training.data.utils import (
     load_encoded_prompt,
     load_indexed_frames,
     resize_to_multiple_of_16,
+    select_neighbor_indices_covisibility,
     visualize_inference_pairs,
 )
 
@@ -117,6 +118,7 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
         split_path: Path,
         num_views: int | None,
         neighbor_selection_mode: NeighborSelectionMode = NeighborSelectionMode.COVISIBILITY,
+        neighbor_selection_granularity: str = "chunk",
         max_test_frames: int | None = None,
         include_all_frames: bool = False,
         use_target_indices: bool = False,
@@ -127,6 +129,10 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
         self.generator = generator
         self.num_views = num_views
         self.neighbor_selection_mode = neighbor_selection_mode
+        self.neighbor_selection_granularity = neighbor_selection_granularity
+        assert neighbor_selection_granularity in {"chunk", "latent_frame"}
+        if neighbor_selection_granularity == "latent_frame":
+            assert neighbor_selection_mode == NeighborSelectionMode.COVISIBILITY
         self.include_all_frames = include_all_frames
         self.use_target_indices = use_target_indices
 
@@ -321,6 +327,43 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
         ), f"Scene {scene_id} requested {resolved} context views but only {len(train_ids)} are selected"
         return resolved
 
+    def _select_latent_frame_neighbors(
+        self,
+        scene_id: str,
+        frame_indices: list[int],
+        is_test_frame: list[bool],
+    ) -> tuple[list[int], torch.Tensor]:
+        train_ids = self.train_ids_by_scene_id[scene_id]
+        num_views = self._resolve_num_views(self.num_views, train_ids, scene_id)
+        transforms = self.transforms_by_scene_id[scene_id]
+        extrinsics_c2w = np.array([frame["transform_matrix"] for frame in transforms["frames"]])
+
+        latent_groups = [(0, 1)] + [
+            (start, min(start + 4, len(frame_indices))) for start in range(1, len(frame_indices), 4)
+        ]
+        selected_by_latent = []
+        for start, end in latent_groups:
+            group_indices = frame_indices[start:end]
+            group_is_test = is_test_frame[start:end]
+            ranking_indices = [frame for frame, keep in zip(group_indices, group_is_test) if keep] or group_indices
+            eligible_train_ids = train_ids - set(group_indices)
+            selected, _ = select_neighbor_indices_covisibility(
+                eligible_train_ids, ranking_indices, extrinsics_c2w, num_views
+            )
+            assert len(selected) == num_views, (
+                f"Scene {scene_id} cannot select {num_views} non-self neighbors "
+                f"for latent group {group_indices}"
+            )
+            selected_by_latent.append(selected)
+
+        neighbor_indices = sorted({frame for selected in selected_by_latent for frame in selected})
+        neighbor_position = {frame: position for position, frame in enumerate(neighbor_indices)}
+        latent_neighbor_mask = torch.zeros(len(selected_by_latent), len(neighbor_indices), dtype=torch.bool)
+        for latent_idx, selected in enumerate(selected_by_latent):
+            positions = [neighbor_position[frame] for frame in selected]
+            latent_neighbor_mask[latent_idx, positions] = True
+        return neighbor_indices, latent_neighbor_mask
+
     def __len__(self) -> int:
         return len(self.inference_items)
 
@@ -332,6 +375,12 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
         frame_indices = pair.test_indices
         neighbor_indices = pair.neighbor_indices
         num_frames = len(frame_indices)
+        latent_neighbor_mask = None
+        if self.neighbor_selection_granularity == "latent_frame":
+            is_test_frame = pair.is_test_frame if pair.is_test_frame is not None else [True] * num_frames
+            neighbor_indices, latent_neighbor_mask = self._select_latent_frame_neighbors(
+                scene_id, list(frame_indices), list(is_test_frame)
+            )
 
         item = {}
 
@@ -382,6 +431,8 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
         # Add metadata
         item["frame_indices"] = torch.tensor(frame_indices, dtype=torch.long)
         item["neighbor_indices"] = torch.tensor(neighbor_indices, dtype=torch.long)
+        if latent_neighbor_mask is not None:
+            item["latent_neighbor_mask"] = latent_neighbor_mask
         item["scene_id"] = scene_id
         item["chunk_idx"] = pair.chunk_idx
         item["valid_frames_mask"] = torch.ones(num_frames, dtype=torch.bool)

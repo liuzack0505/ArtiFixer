@@ -196,6 +196,15 @@ _DEFAULT_ATTENTION_BACKEND = _select_attention_config()
 _FLEX_BLOCK_SIZE: int | tuple[int, int] = (256, 128) if _FLEX_KERNEL_OPTIONS.get("BACKEND") == "FLASH" else 128
 
 
+def expand_neighbor_attention_mask(
+    latent_mask: torch.Tensor, query_frame_seqlen: int, neighbor_frame_seqlen: int
+) -> torch.Tensor:
+    """Expand a per-latent-frame routing mask to patch-token attention dimensions."""
+    mask = latent_mask.repeat_interleave(query_frame_seqlen, dim=1)
+    mask = mask.repeat_interleave(neighbor_frame_seqlen, dim=2)
+    return mask.unsqueeze(1)
+
+
 class ArtifixerTransformer(nn.Module):
 
     # Context-parallelism state — set via enable/disable_context_parallel.
@@ -281,6 +290,7 @@ class ArtifixerTransformer(nn.Module):
         kv_cache: dict[str, torch.Tensor] | None = None,
         crossattn_cache: dict[str, torch.Tensor | bool] | None = None,
         neighbor_crossattn_cache: dict[str, torch.Tensor | bool] | None = None,
+        neighbor_attention_mask: torch.Tensor | None = None,
         current_start: int = 0,
         frame_offset: int = 0,
         return_dict: bool = False,
@@ -362,6 +372,11 @@ class ArtifixerTransformer(nn.Module):
             self.prope_cross_attn_tgt._precompute_and_cache_apply_fns(neighbor_w2cs, neighbor_Ks)
 
             neighbor_hidden_states = self.patch_embedding(neighbor_hidden_states)
+            neighbor_frame_seqlen = neighbor_hidden_states.shape[-2] * neighbor_hidden_states.shape[-1]
+            if neighbor_attention_mask is not None:
+                assert neighbor_attention_mask.shape == (
+                    batch_size, post_patch_num_frames, neighbor_hidden_states.shape[2]
+                )
             neighbor_hidden_states = neighbor_hidden_states.flatten(2).transpose(1, 2)
 
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
@@ -478,6 +493,9 @@ class ArtifixerTransformer(nn.Module):
                     timestep_proj = timestep_proj.flatten(0, 1)
             opacity_extra_patches = opacity_extra_patches[:, seq_start:seq_end].contiguous()
             camera_extra_patches = camera_extra_patches[:, seq_start:seq_end].contiguous()
+            if neighbor_attention_mask is not None:
+                start = self._cp_rank * frames_per_rank
+                neighbor_attention_mask = neighbor_attention_mask[:, start : start + frames_per_rank]
 
             # PRoPE src: precompute for LOCAL camera/frame range only (tgt already done above with full neighbors)
             if neighbor_hidden_states is not None:
@@ -490,6 +508,11 @@ class ArtifixerTransformer(nn.Module):
             # Standard path: precompute PRoPE src for all cameras
             if neighbor_hidden_states is not None:
                 self.prope_cross_attn_src._precompute_and_cache_apply_fns(w2cs, Ks)
+
+        if neighbor_attention_mask is not None:
+            neighbor_attention_mask = expand_neighbor_attention_mask(
+                neighbor_attention_mask, frame_seqlen, neighbor_frame_seqlen
+            )
 
         # 4. Transformer blocks
         use_checkpointing = torch.is_grad_enabled() and self.gradient_checkpointing
@@ -526,6 +549,7 @@ class ArtifixerTransformer(nn.Module):
                 kv_cache[i] if kv_cache is not None else None,
                 block_crossattn_cache,
                 block_neighbor_crossattn_cache,
+                neighbor_attention_mask,
                 current_start,
                 frame_seqlen,
                 self.prope_cross_attn_src,
@@ -719,6 +743,7 @@ class ArtifixerTransformerBlock(nn.Module):
         kv_cache: dict[str, torch.Tensor] | None,
         crossattn_cache: dict[str, torch.Tensor | bool] | None,
         neighbor_crossattn_cache: dict[str, torch.Tensor | bool] | None,
+        neighbor_attention_mask: torch.Tensor | None,
         current_start: int,
         frame_seqlen: int,
         cross_attn_src: PropeDotProductAttention,
@@ -804,6 +829,7 @@ class ArtifixerTransformerBlock(nn.Module):
             ignore_neighbors=ignore_neighbors,
             crossattn_cache=crossattn_cache,
             neighbor_crossattn_cache=neighbor_crossattn_cache,
+            neighbor_attention_mask=neighbor_attention_mask,
             prope_attn_src=cross_attn_src,
             prope_attn_tgt=cross_attn_tgt,
         )
@@ -852,6 +878,7 @@ class ArtifixerCrossAttnProcessor:
         ignore_neighbors: bool = False,
         crossattn_cache: dict[str, torch.Tensor | bool] | None = None,
         neighbor_crossattn_cache: dict[str, torch.Tensor | bool] | None = None,
+        neighbor_attention_mask: torch.Tensor | None = None,
         prope_attn_src: PropeDotProductAttention | None = None,
         prope_attn_tgt: PropeDotProductAttention | None = None,
     ) -> torch.Tensor:
@@ -910,10 +937,10 @@ class ArtifixerCrossAttnProcessor:
                 query_neighbor,
                 key_neighbor,
                 value_neighbor,
-                attn_mask=None,
+                attn_mask=neighbor_attention_mask,
                 dropout_p=0.0,
                 is_causal=False,
-                backend=self._attention_backend,
+                backend=None if neighbor_attention_mask is not None else self._attention_backend,
             )
 
             hidden_states_neighbor_dtype = hidden_states_neighbor.dtype

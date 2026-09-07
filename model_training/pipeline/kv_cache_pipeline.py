@@ -105,6 +105,7 @@ class ArtifixerKvCachePipeline(ArtifixerPipelineBase):
         show_progress: bool = False,
         progress_bar_leave: bool = True,
         max_neighbors_per_encode: int | None = None,
+        latent_neighbor_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if negative_prompt is not None:
             logger.warning("KV-cache pipeline does not support classifier-free guidance; negative_prompt is ignored.")
@@ -127,6 +128,7 @@ class ArtifixerKvCachePipeline(ArtifixerPipelineBase):
             show_progress=show_progress,
             progress_bar_leave=progress_bar_leave,
             max_neighbors_per_encode=max_neighbors_per_encode,
+            latent_neighbor_mask=latent_neighbor_mask,
         )
         return self.decode_latents_to_video(latents)
 
@@ -147,15 +149,22 @@ class ArtifixerKvCachePipeline(ArtifixerPipelineBase):
         show_progress: bool = False,
         progress_bar_leave: bool = True,
         max_neighbors_per_encode: int | None = None,
+        latent_neighbor_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         condition = self.encode_video_frames(rendered_rgb.to(self.vae.device)).cpu()
 
         batch_size = rendered_rgb.shape[0]
         if neighbors is not None:
             assert neighbors.shape[0] == batch_size, "`neighbors` batch size has to match `rendered_rgb`"
-            neighbors_condition = self.encode_neighbors(neighbors, max_neighbors_per_encode)
-        else:
+        if latent_neighbor_mask is not None:
+            assert neighbors is not None, "`latent_neighbor_mask` requires `neighbors`"
+            assert latent_neighbor_mask.shape[:1] == (batch_size,)
+            assert latent_neighbor_mask.shape[2] == neighbors.shape[1]
             neighbors_condition = None
+        else:
+            neighbors_condition = (
+                self.encode_neighbors(neighbors, max_neighbors_per_encode) if neighbors is not None else None
+            )
 
         if isinstance(prompt, torch.Tensor):
             assert prompt.ndim == 3, "`prompt` has to be a 3D tensor"
@@ -183,6 +192,9 @@ class ArtifixerKvCachePipeline(ArtifixerPipelineBase):
             use_exit_flag=False,
             show_progress=show_progress,
             progress_bar_leave=progress_bar_leave,
+            raw_neighbors=neighbors if latent_neighbor_mask is not None else None,
+            latent_neighbor_mask=latent_neighbor_mask,
+            max_neighbors_per_encode=max_neighbors_per_encode,
         )
 
     @torch.no_grad()
@@ -218,6 +230,9 @@ class ArtifixerKvCachePipeline(ArtifixerPipelineBase):
         ignore_neighbors: bool = False,
         show_progress: bool = False,
         progress_bar_leave: bool = True,
+        raw_neighbors: torch.Tensor | None = None,
+        latent_neighbor_mask: torch.Tensor | None = None,
+        max_neighbors_per_encode: int | None = None,
     ) -> torch.Tensor:
         batch_size, _, latent_num_frames, latent_height, latent_width = condition.shape
         p_t, p_h, p_w = self.transformer.patch_size
@@ -236,6 +251,14 @@ class ArtifixerKvCachePipeline(ArtifixerPipelineBase):
         self._initialize_kv_cache(batch_size, frame_seq_length, num_cache_frames)
         self._initialize_crossattn_cache("crossattn_cache")
         self._initialize_crossattn_cache("neighbor_crossattn_cache")
+
+        if latent_neighbor_mask is not None and latent_neighbor_mask.shape[1] < latent_num_frames:
+            pad_frames = latent_num_frames - latent_neighbor_mask.shape[1]
+            latent_neighbor_mask = torch.cat(
+                [latent_neighbor_mask, latent_neighbor_mask[:, -1:].expand(-1, pad_frames, -1)], dim=1
+            )
+        if latent_neighbor_mask is not None:
+            assert latent_neighbor_mask.shape[1] == latent_num_frames
 
         current_start_frame = 0
         current_uncompressed_start_frame = 0
@@ -270,20 +293,36 @@ class ArtifixerKvCachePipeline(ArtifixerPipelineBase):
             chunk_w2cs = w2cs[:, current_start_frame:current_end_frame].to(self.vae.device)
             chunk_Ks = Ks[:, current_start_frame:current_end_frame].to(self.vae.device)
 
+            block_neighbor_mask = None
+            block_neighbors_condition = neighbors_condition
+            block_neighbor_w2cs = neighbor_w2cs
+            block_neighbor_Ks = neighbor_Ks
+            if latent_neighbor_mask is not None:
+                block_neighbor_mask = latent_neighbor_mask[:, current_start_frame:current_end_frame]
+                used_neighbors = block_neighbor_mask.any(dim=(0, 1))
+                assert used_neighbors.any(), "Each latent block must select at least one neighbor"
+                block_neighbor_mask = block_neighbor_mask[:, :, used_neighbors]
+                block_neighbors = raw_neighbors[:, used_neighbors.to(raw_neighbors.device)]
+                block_neighbors_condition = self.encode_neighbors(block_neighbors, max_neighbors_per_encode)
+                block_neighbor_w2cs = neighbor_w2cs[:, used_neighbors]
+                block_neighbor_Ks = neighbor_Ks[:, used_neighbors]
+                self._initialize_crossattn_cache("neighbor_crossattn_cache")
+
             transformer_kwargs = dict(
                 hidden_states=latents,
                 encoder_hidden_states=encoded_prompt,
-                neighbor_hidden_states=neighbors_condition,
+                neighbor_hidden_states=block_neighbors_condition,
                 ignore_neighbors=ignore_neighbors,
                 opacity=chunk_opacity,
                 camera_rays=chunk_camera_rays,
                 w2cs=chunk_w2cs,
-                neighbor_w2cs=neighbor_w2cs,
+                neighbor_w2cs=block_neighbor_w2cs,
                 Ks=chunk_Ks,
-                neighbor_Ks=neighbor_Ks,
+                neighbor_Ks=block_neighbor_Ks,
                 kv_cache=self.kv_cache1,
                 crossattn_cache=self.crossattn_cache,
                 neighbor_crossattn_cache=self.neighbor_crossattn_cache,
+                neighbor_attention_mask=block_neighbor_mask,
                 current_start=current_start_frame * frame_seq_length,
                 frame_offset=current_start_frame,
                 return_dict=False,

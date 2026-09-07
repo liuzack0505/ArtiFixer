@@ -100,5 +100,37 @@ class ReconstructedColmapEvalDatasetTests(unittest.TestCase):
         self.assertEqual(tuple(item["camera_rays"].shape[-3:-1]), tuple(item["rgb_rendered"].shape[-2:]))
 
 
+    def test_latent_frame_neighbors_are_selected_per_temporal_group(self) -> None:
+        dataset = object.__new__(ReconstructedColmapEvalDataset)
+        dataset.num_views = 2
+        dataset.train_ids_by_scene_id = {"scene": {0, 2, 4, 6, 8, 10}}
+        dataset.transforms_by_scene_id = {
+            "scene": {
+                "frames": [
+                    {
+                        "transform_matrix": [
+                            [1.0, 0.0, 0.0, float(index)],
+                            [0.0, 1.0, 0.0, 0.0],
+                            [0.0, 0.0, 1.0, 0.0],
+                            [0.0, 0.0, 0.0, 1.0],
+                        ]
+                    }
+                    for index in range(11)
+                ]
+            }
+        }
+
+        neighbor_indices, mask = dataset._select_latent_frame_neighbors(
+            "scene", list(range(9)), [False] * 9
+        )
+
+        self.assertEqual(tuple(mask.shape), (3, len(neighbor_indices)))
+        self.assertEqual(mask.sum(dim=1).tolist(), [2, 2, 2])
+        groups = ({0}, {1, 2, 3, 4}, {5, 6, 7, 8})
+        for latent_idx, group in enumerate(groups):
+            selected = {neighbor_indices[position] for position in mask[latent_idx].nonzero().flatten().tolist()}
+            self.assertTrue(selected.isdisjoint(group))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -79,6 +79,13 @@ def validate_evalset_args(parser: argparse.ArgumentParser, args: argparse.Namesp
         parser.error("--output_fps must be positive")
     if args.num_views is not None and args.num_views <= 0:
         parser.error("--num_views must be positive")
+    if args.neighbor_selection_granularity == "latent_frame":
+        if not is_reconstructed_colmap_evalset(args.evalset):
+            parser.error("--neighbor_selection_granularity=latent_frame requires a reconstructed COLMAP evalset")
+        if args.neighbor_selection_mode != NeighborSelectionMode.COVISIBILITY.value:
+            parser.error("--neighbor_selection_granularity=latent_frame requires --neighbor_selection_mode=covisibility")
+        if args.inference_pipeline != "kv_cache":
+            parser.error("--neighbor_selection_granularity=latent_frame requires --inference_pipeline=kv_cache")
 
     if is_dl3dv_reconstruction_evalset(args.evalset):
         required_args = ("split_path", "dl3dv_dir", "prompt_dir", "recon_results_dir")
@@ -299,6 +306,7 @@ def get_output_dir(args) -> Path:
     """Get output directory based on evalset."""
     ckpt_full_name = checkpoint_output_name(args)
     sink_suffix = f"_sink{args.sink_size}" if args.sink_size > 0 else ""
+    granularity_suffix = "_latent_neighbors" if args.neighbor_selection_granularity == "latent_frame" else ""
     if args.render_trajectory == "val_frames":
         trajectory_suffix = ""
     elif args.render_trajectory == "trajectory":
@@ -317,7 +325,7 @@ def get_output_dir(args) -> Path:
     ):
         mode_name = (
             f"distilled_views_{args.evalset}_{num_views}_"
-            f"{args.neighbor_selection_mode}{sink_suffix}{trajectory_suffix}"
+            f"{args.neighbor_selection_mode}{sink_suffix}{trajectory_suffix}{granularity_suffix}"
         )
         return args.save_dir / ckpt_full_name / mode_name
     if args.evalset == "nerfbusters":
@@ -571,6 +579,9 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
 
     neighbor_w2cs = item["neighbor_w2cs"].unsqueeze(0).to(device)
     neighbor_Ks = item["neighbor_Ks"].unsqueeze(0).to(device)
+    latent_neighbor_mask = item.get("latent_neighbor_mask")
+    if latent_neighbor_mask is not None:
+        latent_neighbor_mask = latent_neighbor_mask.unsqueeze(0).to(device)
 
     kwargs = {
         "rendered_rgb": rgb_rendered,
@@ -586,6 +597,8 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
         "show_progress": rank == 0,
         "max_neighbors_per_encode": args.max_neighbors_per_encode,
     }
+    if latent_neighbor_mask is not None:
+        kwargs["latent_neighbor_mask"] = latent_neighbor_mask
 
     torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
@@ -894,6 +907,12 @@ def main(args: argparse.Namespace, dataset_factory=create_dataset, output_dir_fa
 def add_inference_args(parser: argparse.ArgumentParser) -> None:
     add_checkpoint_args(parser)
     parser.add_argument("--save_dir", type=Path, required=True)
+    parser.add_argument(
+        "--neighbor_selection_granularity",
+        default="chunk",
+        choices=["chunk", "latent_frame"],
+        help="Select one neighbor set per eval chunk or independently for each temporally compressed latent frame.",
+    )
     parser.add_argument(
         "--inference_pipeline",
         type=str,

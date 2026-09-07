@@ -19,6 +19,7 @@ def create_reconstructed_colmap_dataset(args, selection_mode, max_test_frames, i
         split_path=args.split_path,
         num_views=args.num_views,
         neighbor_selection_mode=selection_mode,
+        neighbor_selection_granularity=args.neighbor_selection_granularity,
         max_test_frames=max_test_frames,
         include_all_frames=include_all_frames,
         use_target_indices=args.render_trajectory == "trajectory",
