@@ -82,8 +82,14 @@ def validate_evalset_args(parser: argparse.ArgumentParser, args: argparse.Namesp
     if args.neighbor_selection_granularity == "latent_frame":
         if not is_reconstructed_colmap_evalset(args.evalset):
             parser.error("--neighbor_selection_granularity=latent_frame requires a reconstructed COLMAP evalset")
-        if args.neighbor_selection_mode != NeighborSelectionMode.COVISIBILITY.value:
-            parser.error("--neighbor_selection_granularity=latent_frame requires --neighbor_selection_mode=covisibility")
+        if args.neighbor_selection_mode not in (
+            NeighborSelectionMode.COVISIBILITY.value,
+            NeighborSelectionMode.GAUSSIAN_FRUSTUM.value,
+        ):
+            parser.error(
+                "--neighbor_selection_granularity=latent_frame requires --neighbor_selection_mode="
+                "covisibility or gaussian_frustum"
+            )
         if args.inference_pipeline != "kv_cache":
             parser.error("--neighbor_selection_granularity=latent_frame requires --inference_pipeline=kv_cache")
 
@@ -100,6 +106,11 @@ def validate_evalset_args(parser: argparse.ArgumentParser, args: argparse.Namesp
     for name in required_args:
         if getattr(args, name) is None:
             parser.error(f"--{name} is required for --evalset {args.evalset}")
+
+    if args.neighbor_selection_mode == NeighborSelectionMode.GAUSSIAN_FRUSTUM.value and not (
+        is_reconstructed_colmap_evalset(args.evalset)
+    ):
+        parser.error("--neighbor_selection_mode=gaussian_frustum is supported only for --evalset reconstructed_colmap")
 
     if args.render_trajectory == "trajectory" and not is_reconstructed_colmap_evalset(args.evalset):
         parser.error("--render_trajectory=trajectory is currently supported only for --evalset reconstructed_colmap")
@@ -994,7 +1005,9 @@ def add_dl3dv_args(parser: argparse.ArgumentParser) -> None:
         "--neighbor_selection_mode",
         type=str,
         default="evenly_spaced",
-        choices=["consecutive", "evenly_spaced", "covisibility"],
+        choices=["consecutive", "evenly_spaced", "covisibility", "gaussian_frustum"],
+        help="How to pick conditioning views. gaussian_frustum (reconstructed_colmap only) ranks views by how many "
+        "Gaussians seen by the target frames also fall inside their frustum.",
     )
 
 

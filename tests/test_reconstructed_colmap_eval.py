@@ -103,6 +103,7 @@ class ReconstructedColmapEvalDatasetTests(unittest.TestCase):
     def test_latent_frame_neighbors_are_selected_per_temporal_group(self) -> None:
         dataset = object.__new__(ReconstructedColmapEvalDataset)
         dataset.num_views = 2
+        dataset.neighbor_selection_mode = NeighborSelectionMode.COVISIBILITY
         dataset.train_ids_by_scene_id = {"scene": {0, 2, 4, 6, 8, 10}}
         dataset.transforms_by_scene_id = {
             "scene": {

@@ -44,6 +44,7 @@ class NeighborSelectionMode(Enum):
     CONSECUTIVE = "consecutive"
     EVENLY_SPACED = "evenly_spaced"
     COVISIBILITY = "covisibility"
+    GAUSSIAN_FRUSTUM = "gaussian_frustum"
 
 
 @dataclass
@@ -174,6 +175,63 @@ def select_neighbor_indices_covisibility(
     return selected, use_reversed
 
 
+def gaussian_frustum_masks(
+    positions: np.ndarray,
+    extrinsics_c2w: np.ndarray,
+    intrinsics: np.ndarray,
+    near: float = 0.01,
+    far: float = 1000.0,
+) -> np.ndarray:
+    """Bit-packed masks of which Gaussian centers fall inside each camera's view frustum.
+
+    Args:
+        positions: (G, 3) Gaussian centers in the world frame of ``extrinsics_c2w``.
+        extrinsics_c2w: (F, 4, 4) OpenGL camera-to-world matrices (transforms.json convention).
+        intrinsics: (F, 6) per-frame ``(w, h, fl_x, fl_y, cx, cy)`` in pixels.
+        near: Near clip plane, as depth along the viewing axis in world units.
+        far: Far clip plane, as depth along the viewing axis in world units.
+
+    Returns:
+        (F, ceil(G / 8)) uint8 array from ``np.packbits``; occlusion and lens distortion are ignored.
+    """
+    positions = np.asarray(positions, dtype=np.float32)
+    masks = []
+    for c2w, (w, h, fl_x, fl_y, cx, cy) in zip(np.asarray(extrinsics_c2w), np.asarray(intrinsics)):
+        w2c = np.linalg.inv(c2w).astype(np.float32)
+        local = positions @ w2c[:3, :3].T + w2c[:3, 3]
+        depth = -local[:, 2]
+        in_depth = (depth > near) & (depth < far)
+        safe_depth = np.where(in_depth, depth, 1.0)
+        u = fl_x * local[:, 0] / safe_depth + cx
+        v = -fl_y * local[:, 1] / safe_depth + cy
+        masks.append(np.packbits(in_depth & (u >= 0) & (u < w) & (v >= 0) & (v < h)))
+    return np.stack(masks)
+
+
+def select_neighbor_indices_gaussian_frustum(
+    train_ids: Set[int], test_indices: List[int], frustum_masks: np.ndarray, num_train: int = 12
+) -> Tuple[List[int], bool]:
+    """Select train views whose frustums contain the most Gaussians seen by the test views."""
+    sorted_train = sorted(train_ids)
+    if len(sorted_train) < num_train:
+        return [], False
+
+    target_mask = np.bitwise_or.reduce(frustum_masks[list(test_indices)], axis=0)
+    overlap = {t_idx: int(np.bitwise_count(frustum_masks[t_idx] & target_mask).sum()) for t_idx in sorted_train}
+
+    selected = sorted(sorted_train, key=lambda x: (-overlap[x], x))[:num_train]
+    selected = sorted(selected)
+
+    test_start = min(test_indices)
+    test_end = max(test_indices)
+    train_center = (selected[0] + selected[-1]) / 2
+    test_center = (test_start + test_end) / 2
+
+    use_reversed = train_center > test_center
+
+    return selected, use_reversed
+
+
 def generate_inference_pairs(
     train_ids: Set[int],
     total_frames: int,
@@ -183,6 +241,7 @@ def generate_inference_pairs(
     extrinsics_c2w: np.ndarray = None,
     test_ids: Set[int] | None = None,
     include_all_frames: bool = False,
+    frustum_masks: np.ndarray | None = None,
 ) -> List[InferencePair]:
     """Generate (neighbor_indices, test_indices) pairs to cover the requested eval trajectory.
 
@@ -196,6 +255,8 @@ def generate_inference_pairs(
         test_ids: Optional explicit set of test frame indices. If None, test frames are the complement of train_ids.
         include_all_frames: If True, cover the full source trajectory instead of only held-out/test frames.
             Explicit target trajectories and full-clip rendering always preserve frame order.
+        frustum_masks: Per-frame Gaussian frustum masks from ``gaussian_frustum_masks``, required for
+            GAUSSIAN_FRUSTUM selection.
     """
     assert (
         max_test_frames is None or max_test_frames > 0
@@ -212,6 +273,11 @@ def generate_inference_pairs(
             return select_neighbor_indices_consecutive(train_ids, target_indices, num_train_context)
         if selection_mode == NeighborSelectionMode.EVENLY_SPACED:
             return select_neighbor_indices_evenly_spaced(train_ids, target_indices, num_train_context)
+        if selection_mode == NeighborSelectionMode.GAUSSIAN_FRUSTUM:
+            assert frustum_masks is not None, "frustum_masks required for GAUSSIAN_FRUSTUM mode"
+            return select_neighbor_indices_gaussian_frustum(
+                train_ids, target_indices, frustum_masks, num_train_context
+            )
         assert extrinsics_c2w is not None, "extrinsics_c2w required for COVISIBILITY mode"
         return select_neighbor_indices_covisibility(train_ids, target_indices, extrinsics_c2w, num_train_context)
 

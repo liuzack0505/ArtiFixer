@@ -14,6 +14,7 @@ The prepared split file stores the exact paths for each scene:
     prompt_path
     camera_scale
     has_gt (optional; defaults to true)
+    reconstruction_checkpoint (optional; 3DGRUT checkpoint, required for gaussian_frustum neighbor selection)
 """
 
 import json
@@ -32,15 +33,22 @@ from model_training.data.utils import (
     InferencePair,
     NeighborSelectionMode,
     compute_camera_rays,
+    gaussian_frustum_masks,
     generate_inference_pairs,
     load_encoded_prompt,
     load_indexed_frames,
     resize_to_multiple_of_16,
     select_neighbor_indices_covisibility,
+    select_neighbor_indices_gaussian_frustum,
     visualize_inference_pairs,
 )
 
 DEFAULT_RECONSTRUCTED_COLMAP_NUM_VIEWS = 12
+# Near-transparent Gaussians (mostly floaters) are ignored when counting frustum overlap.
+GAUSSIAN_FRUSTUM_MIN_OPACITY = 0.1
+# Frustum clip planes in world (COLMAP) units.
+GAUSSIAN_FRUSTUM_NEAR = 0.01
+GAUSSIAN_FRUSTUM_FAR = 1000.0
 
 
 @dataclass(frozen=True)
@@ -55,6 +63,7 @@ class ReconstructedColmapScene:
     prompt_paths: list[Path]
     camera_scale: float
     has_gt: bool
+    reconstruction_checkpoint: Path | None = None
 
 
 def resolve_prepared_path(split_root: Path, value: str, field_name: str) -> Path:
@@ -132,7 +141,10 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
         self.neighbor_selection_granularity = neighbor_selection_granularity
         assert neighbor_selection_granularity in {"chunk", "latent_frame"}
         if neighbor_selection_granularity == "latent_frame":
-            assert neighbor_selection_mode == NeighborSelectionMode.COVISIBILITY
+            assert neighbor_selection_mode in (
+                NeighborSelectionMode.COVISIBILITY,
+                NeighborSelectionMode.GAUSSIAN_FRUSTUM,
+            )
         self.include_all_frames = include_all_frames
         self.use_target_indices = use_target_indices
 
@@ -210,6 +222,11 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
             prompt_paths=[prompt_path],
             camera_scale=resolve_required_number(metadata, "camera_scale"),
             has_gt=has_gt,
+            reconstruction_checkpoint=(
+                resolve_prepared_path(split_root, metadata["reconstruction_checkpoint"], "reconstruction_checkpoint")
+                if "reconstruction_checkpoint" in metadata
+                else None
+            ),
         )
 
     def _reset_scene_data(self) -> None:
@@ -218,6 +235,7 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
         self.transforms_by_scene_id = {}
         self.train_ids_by_scene_id = {}
         self.target_ids_by_scene_id = {}
+        self.frustum_masks_by_scene_id = {}
 
     def _register_scene(self, scene: ReconstructedColmapScene, transforms: dict[str, Any], verbose: bool) -> None:
         scene_id = scene.scene_id
@@ -232,7 +250,40 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
         self.scenes_by_scene_id[scene_id] = scene
         self.train_ids_by_scene_id[scene_id] = train_ids
         self.target_ids_by_scene_id[scene_id] = target_ids
+        if self.neighbor_selection_mode == NeighborSelectionMode.GAUSSIAN_FRUSTUM:
+            self.frustum_masks_by_scene_id[scene_id] = self._load_frustum_masks(scene, transforms, verbose)
         self.scene_ids.append(scene_id)
+
+    @staticmethod
+    def _load_frustum_masks(
+        scene: ReconstructedColmapScene, transforms: dict[str, Any], verbose: bool
+    ) -> np.ndarray:
+        checkpoint_path = scene.reconstruction_checkpoint
+        assert checkpoint_path is not None and checkpoint_path.is_file(), (
+            f"Scene {scene.scene_id!r} needs an existing reconstruction_checkpoint for gaussian_frustum "
+            f"neighbor selection, got {checkpoint_path}"
+        )
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        opacity = torch.sigmoid(checkpoint["density"].detach().float()).squeeze(-1)
+        positions = checkpoint["positions"].detach().float()[opacity >= GAUSSIAN_FRUSTUM_MIN_OPACITY].numpy()
+        del checkpoint
+
+        frames = transforms["frames"]
+        extrinsics_c2w = np.array([frame["transform_matrix"] for frame in frames], dtype=np.float64)
+        intrinsics = np.array(
+            [[frame.get(key, transforms.get(key)) for key in ("w", "h", "fl_x", "fl_y", "cx", "cy")] for frame in frames],
+            dtype=np.float64,
+        )
+        masks = gaussian_frustum_masks(
+            positions, extrinsics_c2w, intrinsics, near=GAUSSIAN_FRUSTUM_NEAR, far=GAUSSIAN_FRUSTUM_FAR
+        )
+        if verbose:
+            print(
+                f"Scene {scene.scene_id}: gaussian_frustum masks for {len(frames)} frames over "
+                f"{len(positions)} Gaussians (opacity >= {GAUSSIAN_FRUSTUM_MIN_OPACITY}, "
+                f"near={GAUSSIAN_FRUSTUM_NEAR}, far={GAUSSIAN_FRUSTUM_FAR})"
+            )
+        return masks
 
     @staticmethod
     def _load_index_set(path: Path) -> set[int]:
@@ -305,6 +356,7 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
                 extrinsics_c2w=extrinsics_c2w,
                 test_ids=target_ids,
                 include_all_frames=self.include_all_frames and target_ids is None,
+                frustum_masks=self.frustum_masks_by_scene_id.get(scene_id),
             )
 
             for pair in pairs:
@@ -347,9 +399,14 @@ class ReconstructedColmapEvalDataset(torch.utils.data.Dataset):
             group_is_test = is_test_frame[start:end]
             ranking_indices = [frame for frame, keep in zip(group_indices, group_is_test) if keep] or group_indices
             eligible_train_ids = train_ids - set(group_indices)
-            selected, _ = select_neighbor_indices_covisibility(
-                eligible_train_ids, ranking_indices, extrinsics_c2w, num_views
-            )
+            if self.neighbor_selection_mode == NeighborSelectionMode.GAUSSIAN_FRUSTUM:
+                selected, _ = select_neighbor_indices_gaussian_frustum(
+                    eligible_train_ids, ranking_indices, self.frustum_masks_by_scene_id[scene_id], num_views
+                )
+            else:
+                selected, _ = select_neighbor_indices_covisibility(
+                    eligible_train_ids, ranking_indices, extrinsics_c2w, num_views
+                )
             assert len(selected) == num_views, (
                 f"Scene {scene_id} cannot select {num_views} non-self neighbors "
                 f"for latent group {group_indices}"
