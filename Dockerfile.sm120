@@ -1,0 +1,100 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CUDA 13 x86 — Blackwell workstation GPUs (RTX PRO 6000 / RTX 50xx, sm_120)
+FROM nvcr.io/nvidia/pytorch:25.04-py3
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TORCH_CUDA_ARCH_LIST="12.0"
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG UID=1005
+ARG GID=1006
+ARG FLASH_ATTN_MAX_JOBS=16
+ARG FLASH_ATTN_NVCC_THREADS=2
+
+# Install CUDA 13 toolkit (base image ships CUDA 12.9; torch cu130 needs CUDA 13 nvcc)
+RUN wget -qO /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
+    && dpkg -i /tmp/cuda-keyring.deb && rm /tmp/cuda-keyring.deb
+RUN apt-get update && apt-get install -y -qq --no-install-recommends \
+    wget git curl build-essential gcc-11 g++-11 libgl1-mesa-dev libglib2.0-0 cuda-toolkit-13-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CUDA_HOME=/usr/local/cuda-13.0
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+
+RUN truncate -s 0 /etc/pip/constraint.txt
+RUN pip install torch==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu130
+RUN pip uninstall -y flash-attn opencv-python || true
+RUN rm -rf /usr/local/lib/python3.12/dist-packages/cv2*
+
+RUN git clone --recurse-submodules https://github.com/liuzack0505/ArtiFixer.git /opt/ArtiFixer
+WORKDIR /opt/ArtiFixer/thirdparty/3DGRUT-ArtiFixer/
+RUN pip install -r requirements.txt
+RUN bash scripts/install_slangc.sh /usr/local
+RUN pip install -e .
+
+# # FA3 — Hopper kernels (warp specialization, async TMA, FP8)
+# # Filter ptxas output to stay under Docker's 2MB log limit per step
+# RUN git clone --depth 1 https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention && \
+#     cd /tmp/flash-attention/hopper && \
+#     MAX_JOBS=${FLASH_ATTN_MAX_JOBS} \
+#     NVCC_THREADS=${FLASH_ATTN_NVCC_THREADS} \
+#     pip install . 2>&1 | awk '!/^ptxas info/' && \
+#     cd / && rm -rf /tmp/flash-attention
+
+# FA4 — CuTeDSL kernels from source for sm_120
+# Clone the repo
+RUN git clone -b feat/sm120-support https://github.com/blake-snc/flash-attention-dao.git /opt/flash-attention
+WORKDIR /opt/flash-attention
+
+# Install the CuTe backend (which is FA4)
+RUN MAX_JOBS=4 pip install -e "flash_attn/cute[dev,cu13]" --no-build-isolation --break-system-packages
+
+# The sm120 fork (Mar 2026) predates cutlass-dsl 4.5+ (removed cute.core.ThrMma) and quack >=0.4
+# (needs cutlass-dsl >=4.7). Pin a matching pair and drop the 4.8 libs the cu13 extra pulled in.
+RUN pip uninstall -y nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-cu12 || true
+RUN pip install "nvidia-cutlass-dsl[cu13]==4.4.2" "quack-kernels==0.3.11"
+
+RUN pip install accelerate==1.13.0 diffusers==0.37.1 transformers==5.5.0 ftfy
+
+RUN pip install einops scipy wandb tqdm Pillow matplotlib opencv-python-headless \
+    pyyaml torchmetrics imageio-ffmpeg h5py av torch-fidelity \
+    git+https://github.com/microsoft/MoGe.git
+# 3DGRUT requirements pull in opencv-python; keep only the headless build so cv2 isn't shadowed
+RUN pip uninstall -y opencv-python && pip install --force-reinstall --no-deps opencv-python-headless
+
+# gsplat's setup imports torch, so build it after torch/MoGe with isolation disabled.
+RUN MAX_JOBS=4 pip install --no-build-isolation \
+    git+https://github.com/nerfstudio-project/gsplat.git@a148287
+
+
+WORKDIR /opt/ArtiFixer/tests
+# RUN python -c "import flash_attn_interface; print('FA3 ok')"
+# RUN python -c "import flash_attn_3; print('FA3 package ok')"
+RUN pip show flash-attn-4 | grep Version && echo 'FA4 ok'
+RUN python -c "import importlib.metadata as m; v = m.version('nvidia-cutlass-dsl'); assert v == '4.4.2', v; print('cutlass-dsl', v)"
+RUN python -c "import cv2; print('cv2 ok:', cv2.__version__)"
+RUN python -c "from moge.model.v2 import MoGeModel; print('MoGe ok')"
+
+# Checkpoints are NOT baked into the image: on first run the node downloads into the shared store
+# /data/checkpoints/<org>/<repo> (bind-mounted data dir): the ArtiFixer checkpoint of the selected
+# model_size (nvidia/ArtiFixer: 14b ~68 GB / 1.3b ~7 GB), the Wan backbone VAE + configs (~0.5 GB),
+# the Wan text encoder (~23 GB) and Qwen/Qwen3-VL-30B-A3B-Instruct (~62 GB) for scene captioning.
+# HF_TOKEN is passed at runtime (docker run -e HF_TOKEN=...), never baked into image layers.
+WORKDIR /opt/ArtiFixer
+
+# Create a group and user with the provided UID and GID.
+RUN if ! getent group ${GID} >/dev/null 2>&1; then \
+    groupadd -g ${GID} appgroup; \
+    fi && \
+    if ! getent passwd ${UID} >/dev/null 2>&1; then \
+    useradd -r -u ${UID} -m -s /bin/bash -g ${GID} appuser; \
+    fi
+
+RUN mkdir -p /app && chown ${UID}:${GID} /app
+
+# Switch to the non-root user
+USER ${UID}:${GID}
+WORKDIR /app
